@@ -1,3 +1,4 @@
+# chatbot.py
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
@@ -23,6 +24,9 @@ NOTES_FILE = Path("notes.txt")
 
 VOICE_MALE = "tr-TR-AhmetNeural"
 VOICE_FEMALE = "tr-TR-EmelNeural"
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+OLLAMA_MODEL = "llama3.1:8b"  # ollama list ile sende ne varsa onu yaz
 
 TURKEY_CITIES = [
     "Adana","Adıyaman","Afyonkarahisar","Ağrı","Amasya","Ankara","Antalya","Artvin","Aydın",
@@ -58,6 +62,9 @@ def read_notes_last(n=12):
     if not content:
         return []
     return content.splitlines()[-n:]
+
+def clear_notes():
+    NOTES_FILE.write_text("", encoding="utf-8")
 
 def turkish_fold(s: str) -> str:
     s = normalize(s)
@@ -117,15 +124,16 @@ def fetch_weather(city: str) -> str:
         if not tmax or not tmin:
             return "Hava tahminini şu an alamadım."
 
-        p = f"%{int(pop[0])}" if pop and pop[0] is not None else "?"
-        # yüzde okunuşu daha doğal:
+        p = f"%{int(pop[0])}" if pop and pop[0] is not None else "%?"
         p_say = p.replace("%", "yüzde ")
-        return f"{resolved} için bugün: en düşük {tmin[0]} derece, en yüksek {tmax[0]} derece. Yağış olasılığı {p_say}."
-
+        return (
+            f"{resolved} için bugün: en düşük {tmin[0]} derece, en yüksek {tmax[0]} derece. "
+            f"Yağış olasılığı {p_say}."
+        )
     except Exception:
         return "Hava tahminini alamadım. İnternet bağlantın açık mı?"
 
-def stt_listen(recognizer: sr.Recognizer, mic: sr.Microphone, phrase_time_limit=7) -> str | None:
+def stt_listen(recognizer: sr.Recognizer, mic: sr.Microphone, phrase_time_limit=6) -> str | None:
     with mic as source:
         recognizer.adjust_for_ambient_noise(source, duration=0.25)
         audio = recognizer.listen(source, phrase_time_limit=phrase_time_limit)
@@ -157,26 +165,52 @@ def tts_clean(text: str) -> str:
         flags=re.UNICODE
     )
     text = emoji_re.sub("", text)
-
-    # süs/ikon karakterleri
     for ch in ["•", "✅", "✨", "🤖", "☕", "💜", "😄", "😊", "😅"]:
         text = text.replace(ch, "")
-
-    # fazla boşluk
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 # =========================
-# Robot Avatar (big, dark, siri-ish)
+# Ollama Chat (stabil ayarlar)
+# =========================
+def ollama_chat(user_text: str, history: list[dict]) -> str:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": history + [{"role": "user", "content": user_text}],
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "num_ctx": 4096
+        }
+    }
+    r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+    return data["message"]["content"]
+
+def is_bad_reply(reply: str) -> bool:
+    r = (reply or "").strip().lower()
+    if len(r) < 2:
+        return True
+    if len(r) > 1400:
+        return True
+    bad_signals = [
+        "as an ai", "i'm just", "i cannot", "lorem ipsum",
+        "bunu bilemem ama", "emin değilim ama"
+    ]
+    if any(x in r for x in bad_signals):
+        return True
+    # aşırı alakasız tek kelime/saçma
+    if r in ["tamam", "evet", "hayır", "bilmiyorum"]:
+        return True
+    return False
+
+# =========================
+# Robot Avatar
 # =========================
 class RobotAvatar(tk.Canvas):
-    """
-    Big robot in center.
-    - eyes follow mouse
-    - listening glow
-    - speaking halo pulse + mouth animation
-    """
-    def __init__(self, parent, size=280,
+    def __init__(self, parent, size=300,
                  bg="#070B14",
                  head="#0B1224",
                  head_border="#1F2A44",
@@ -202,42 +236,42 @@ class RobotAvatar(tk.Canvas):
         self._mouth_phase = 0.0
         self._halo_phase = 0.0
         self._anim_job = None
-        self._blink_job = None
 
         self._draw()
         self._center_pupils()
         self._schedule_blink()
         self._start_anim_loop()
 
+    def _bbox(self, center, r):
+        x, y = center
+        return (x-r, y-r, x+r, y+r)
+
     def _draw(self):
         s = self.size
         cx, cy = s/2, s/2
 
         pad = 14
-        self.halo = self.create_oval(pad, pad, s-pad, s-pad, outline="", width=7)
+        self.halo = self.create_oval(pad, pad, s-pad, s-pad, outline="", width=8)
 
-        head_pad = 34
-        self.head_oval = self.create_oval(
+        head_pad = 36
+        self.create_oval(
             head_pad, head_pad, s-head_pad, s-head_pad,
             fill=self.head, outline=self.head_border, width=3
         )
 
-        # antenna
-        self.create_line(cx, head_pad-4, cx, head_pad-24, fill="#94A3B8", width=4)
-        self.create_oval(cx-7, head_pad-38, cx+7, head_pad-22, fill=self.neon, outline="")
+        self.create_line(cx, head_pad-4, cx, head_pad-26, fill="#94A3B8", width=4)
+        self.create_oval(cx-7, head_pad-40, cx+7, head_pad-22, fill=self.neon, outline="")
 
-        # face plate
-        plate_pad = 60
+        plate_pad = 62
         self.create_oval(
             plate_pad, plate_pad, s-plate_pad, s-plate_pad,
             fill="#0F1B36", outline="#1F2A44", width=2
         )
 
-        self.eye_r = 28
+        self.eye_r = 30
         self.pupil_r = 10
-
-        self.left_eye_center = (cx - 52, cy - 18)
-        self.right_eye_center = (cx + 52, cy - 18)
+        self.left_eye_center = (cx - 56, cy - 20)
+        self.right_eye_center = (cx + 56, cy - 20)
 
         self.left_eye = self.create_oval(*self._bbox(self.left_eye_center, self.eye_r), fill=self.eye_white, outline="")
         self.right_eye = self.create_oval(*self._bbox(self.right_eye_center, self.eye_r), fill=self.eye_white, outline="")
@@ -245,18 +279,12 @@ class RobotAvatar(tk.Canvas):
         self.left_pupil = self.create_oval(*self._bbox(self.left_eye_center, self.pupil_r), fill=self.pupil, outline="")
         self.right_pupil = self.create_oval(*self._bbox(self.right_eye_center, self.pupil_r), fill=self.pupil, outline="")
 
-        # mouth
-        self.mouth_y = cy + 64
-        self.mouth = self.create_line(cx-42, self.mouth_y, cx+42, self.mouth_y,
-                                      fill="#E2E8F0", width=7, capstyle="round")
+        self.mouth_y = cy + 70
+        self.mouth = self.create_line(cx-46, self.mouth_y, cx+46, self.mouth_y,
+                                      fill="#E2E8F0", width=8, capstyle="round")
 
-        # side lights
-        self.create_oval(cx-98, cy+38, cx-80, cy+56, fill="#22C55E", outline="")
-        self.create_oval(cx+80, cy+38, cx+98, cy+56, fill="#60A5FA", outline="")
-
-    def _bbox(self, center, r):
-        x, y = center
-        return (x-r, y-r, x+r, y+r)
+        self.create_oval(cx-106, cy+40, cx-84, cy+62, fill="#22C55E", outline="")
+        self.create_oval(cx+84, cy+40, cx+106, cy+62, fill="#60A5FA", outline="")
 
     def set_listening(self, v: bool):
         self.is_listening = v
@@ -285,10 +313,9 @@ class RobotAvatar(tk.Canvas):
         py = ey + dy * scale
         self.coords(pupil_id, *self._bbox((px, py), self.pupil_r))
 
-    # blink
     def _schedule_blink(self):
         delay = random.randint(2400, 6200)
-        self._blink_job = self.after(delay, self._blink)
+        self.after(delay, self._blink)
 
     def _blink(self):
         def squish(step):
@@ -322,7 +349,6 @@ class RobotAvatar(tk.Canvas):
         squish_one(self.left_eye, self.left_pupil, self.left_eye_center)
         squish_one(self.right_eye, self.right_pupil, self.right_eye_center)
 
-    # animation
     def _start_anim_loop(self):
         if self._anim_job is not None:
             return
@@ -332,17 +358,17 @@ class RobotAvatar(tk.Canvas):
         self._anim_job = None
 
         self._halo_phase += 0.12
-        pulse = (math.sin(self._halo_phase) + 1) / 2  # 0..1
+        pulse = (math.sin(self._halo_phase) + 1) / 2
 
         if self.is_speaking:
             self.itemconfig(self.halo, outline=self.glow_speak)
-            self.itemconfig(self.halo, width=int(6 + 3*pulse))
+            self.itemconfig(self.halo, width=int(7 + 3*pulse))
         elif self.is_listening:
             self.itemconfig(self.halo, outline=self.glow_listen)
-            self.itemconfig(self.halo, width=7)
+            self.itemconfig(self.halo, width=8)
         else:
             self.itemconfig(self.halo, outline="")
-            self.itemconfig(self.halo, width=7)
+            self.itemconfig(self.halo, width=8)
 
         if self.is_speaking:
             self._mouth_phase += 0.35
@@ -350,11 +376,11 @@ class RobotAvatar(tk.Canvas):
             cx = self.size/2
             y = self.mouth_y
             amp = 10 + 12*m
-            self.coords(self.mouth, cx-42, y-amp/2, cx+42, y+amp/2)
+            self.coords(self.mouth, cx-46, y-amp/2, cx+46, y+amp/2)
         else:
             cx = self.size/2
             y = self.mouth_y
-            self.coords(self.mouth, cx-42, y, cx+42, y)
+            self.coords(self.mouth, cx-46, y, cx+46, y)
 
         self._start_anim_loop()
 
@@ -365,8 +391,8 @@ class LeeApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Lee • Dark Robot Assistant")
-        self.root.geometry("1120x760")
-        self.root.minsize(980, 660)
+        self.root.geometry("1120x780")
+        self.root.minsize(980, 680)
 
         # Theme
         self.bg = "#070B14"
@@ -392,9 +418,22 @@ class LeeApp:
         self._tts_lock = threading.Lock()
         self._init_player()
 
-        self.is_listening = False
-        self.waiting_tea_answer = False
+        # state
         self.typing_widget = None
+        self._stop_listen_event = threading.Event()
+        self._always_thread = None
+
+        # LLM memory (oturum içi)
+        self.llm_history = [
+            {"role": "system", "content": (
+                "Sen Lee adında robotik bir dijital asistansın. Kullanıcı Beyza. Türkçe konuş.\n"
+                "Kurallar:\n"
+                "- Kısa, net cevap ver (maks 6-8 cümle).\n"
+                "- Bilmediğin şeyi UYDURMA. Emin değilsen: 'Emin değilim' de ve 1 kısa soru sor.\n"
+                "- Gereksiz emoji kullanma.\n"
+                "- Kullanıcının istediğini netleştirmeden uzun anlatma.\n"
+            )}
+        ]
 
         # Top
         top = tk.Frame(root, bg=self.bg)
@@ -417,7 +456,7 @@ class LeeApp:
                                    font=("Segoe UI", 11))
         self.status_lbl.pack(anchor="center", pady=(0, 8))
 
-        self.robot = RobotAvatar(center, size=280, bg=self.bg)
+        self.robot = RobotAvatar(center, size=300, bg=self.bg)
         self.robot.pack(anchor="center")
 
         # Middle
@@ -452,13 +491,14 @@ class LeeApp:
         self.entry.pack(side="left", fill="x", expand=True, ipady=12, padx=(0, 10))
         self.entry.bind("<Return>", lambda e: self.send_text())
 
-        self.mic_btn = tk.Button(
-            bottom, text="🎤 Dinle", bg=self.accent, fg="#081018",
+        # Buton: dinleme aç/kapat
+        self.listen_btn = tk.Button(
+            bottom, text="Dinleme: Açık", bg=self.accent, fg="#081018",
             relief="flat", font=("Segoe UI", 11, "bold"),
             padx=16, pady=10,
-            command=self.on_listen_click
+            command=self.toggle_always_listen
         )
-        self.mic_btn.pack(side="right")
+        self.listen_btn.pack(side="right")
 
         # Side panel
         self._build_side_panel()
@@ -471,11 +511,68 @@ class LeeApp:
         self.refresh_notes()
         self.tick_clock()
 
-        self.add_bubble("Lee", "Merhaba Beyza! Ben Lee. İstersen 'İstanbul hava durumu' de.")
-        self.add_bubble("Sistem", f"Neural ses aktif ({self.voice})")
+        welcome = "Hoş geldin Beyza. Ben senin dijital asistanın Lee. Bugün ne yapmak istersin?"
+        self.add_bubble("Lee", welcome)
+        self.speak(welcome)
 
-        self.ask_tea_checkin(initial=True)
+        # sürekli dinleme başlat
+        self.start_always_listen()
 
+        # kapanışta dinlemeyi durdur
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ---------- close ----------
+    def on_close(self):
+        try:
+            self.stop_always_listen()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    # ---------- always listen ----------
+    def start_always_listen(self):
+        if self._always_thread and self._always_thread.is_alive():
+            return
+        self._stop_listen_event.clear()
+        self._always_thread = threading.Thread(target=self._always_listen_loop, daemon=True)
+        self._always_thread.start()
+
+    def stop_always_listen(self):
+        self._stop_listen_event.set()
+
+    def toggle_always_listen(self):
+        if self._stop_listen_event.is_set():
+            self.start_always_listen()
+            self.listen_btn.config(text="Dinleme: Açık")
+            self.add_bubble("Lee", "Sürekli dinleme açıldı.")
+            self.speak("Sürekli dinleme açıldı.")
+        else:
+            self.stop_always_listen()
+            self.listen_btn.config(text="Dinleme: Kapalı")
+            self.add_bubble("Lee", "Sürekli dinleme kapatıldı.")
+            self.speak("Sürekli dinleme kapatıldı.")
+
+    def _always_listen_loop(self):
+        while not self._stop_listen_event.is_set():
+            # Lee konuşuyorsa kendi sesini yakalamasın
+            if self.robot.is_speaking:
+                time.sleep(0.2)
+                continue
+
+            self.root.after(0, lambda: (self.robot.set_listening(True),
+                                        self.status_lbl.config(text="Dinliyorum...")))
+
+            heard = stt_listen(self.recognizer, self.mic, phrase_time_limit=6)
+
+            self.root.after(0, lambda: (self.robot.set_listening(False),
+                                        self.status_lbl.config(text="Lee aktif • Hazırım")))
+
+            if heard:
+                self.root.after(0, lambda h=heard: self.handle_text(h))
+
+            time.sleep(0.15)
+
+    # ---------- UI ----------
     def _setup_ttk(self):
         style = ttk.Style()
         try:
@@ -501,10 +598,13 @@ class LeeApp:
         tk.Button(box, text="Hava Tahmini", bg=self.panel2, fg=self.text, relief="flat",
                   font=("Segoe UI", 10), command=self.say_weather).pack(fill="x", pady=(10, 0))
 
-        tk.Button(box, text="Çay Sor", bg=self.panel2, fg=self.text, relief="flat",
-                  font=("Segoe UI", 10), command=lambda: self.ask_tea_checkin(initial=False)).pack(fill="x", pady=(8, 0))
+        tk.Button(box, text="Notları Yenile", bg=self.panel2, fg=self.text, relief="flat",
+                  font=("Segoe UI", 10), command=self.refresh_notes).pack(fill="x", pady=(8, 0))
 
-        tk.Button(box, text="Ses Değiştir (Ahmet/Emel)", bg=self.panel2, fg=self.text, relief="flat",
+        tk.Button(box, text="Notları Sil", bg="#3B1F2A", fg=self.text, relief="flat",
+                  font=("Segoe UI", 10), command=self.ui_clear_notes).pack(fill="x", pady=(8, 0))
+
+        tk.Button(box, text="Ses Değiştir", bg=self.panel2, fg=self.text, relief="flat",
                   font=("Segoe UI", 10), command=self.toggle_voice).pack(fill="x", pady=(8, 0))
 
         tk.Button(box, text="Komutlar", bg=self.panel2, fg=self.text, relief="flat",
@@ -514,12 +614,20 @@ class LeeApp:
         self.notes_list = tk.Listbox(
             box, bg=self.panel2, fg=self.text, relief="flat",
             highlightbackground=self.border, highlightthickness=1,
-            font=("Segoe UI", 10), height=10
+            font=("Segoe UI", 10), height=12
         )
         self.notes_list.pack(fill="x")
 
-        tk.Button(box, text="Notları Yenile", bg=self.panel2, fg=self.text, relief="flat",
-                  font=("Segoe UI", 10), command=self.refresh_notes).pack(fill="x", pady=(10, 0))
+    def ui_clear_notes(self):
+        if messagebox.askyesno("Notları Sil", "Tüm notları silmek istediğine emin misin?"):
+            try:
+                clear_notes()
+            except Exception:
+                pass
+            self.refresh_notes()
+            msg = "Tamam. Tüm notları sildim."
+            self.add_bubble("Lee", msg)
+            self.speak(msg)
 
     def _global_mouse_follow(self, event):
         try:
@@ -529,7 +637,7 @@ class LeeApp:
         except Exception:
             pass
 
-    # chat
+    # ---------- chat ----------
     def add_bubble(self, who: str, msg: str):
         outer = tk.Frame(self.chat_frame, bg=self.panel)
         outer.pack(fill="x", pady=6, padx=12)
@@ -573,7 +681,7 @@ class LeeApp:
     def _on_canvas_configure(self, event):
         self.chat_canvas.itemconfig(self.chat_window, width=event.width)
 
-    # audio
+    # ---------- audio ----------
     def _init_player(self):
         try:
             pygame.mixer.init()
@@ -626,7 +734,7 @@ class LeeApp:
         except Exception:
             pass
 
-    # clock / notes
+    # ---------- clock / notes ----------
     def tick_clock(self):
         now = datetime.datetime.now()
         self.time_lbl.config(text=now.strftime("%H:%M:%S"))
@@ -635,10 +743,10 @@ class LeeApp:
 
     def refresh_notes(self):
         self.notes_list.delete(0, "end")
-        for line in read_notes_last(10):
+        for line in read_notes_last(12):
             self.notes_list.insert("end", line)
 
-    # actions
+    # ---------- actions ----------
     def show_help(self):
         messagebox.showinfo(
             "Komutlar",
@@ -647,12 +755,15 @@ class LeeApp:
             "• İstanbul hava durumu / Ankara hava tahmini\n"
             "• not al: ...\n"
             "• notlar\n"
-            "• kapat"
+            "• notları sil\n"
+            "• güncelle / notları yenile\n"
+            "• kapat\n"
+            "• normal sohbet (Ollama)"
         )
 
     def toggle_voice(self):
         self.voice = VOICE_FEMALE if self.voice == VOICE_MALE else VOICE_MALE
-        self.add_bubble("Sistem", f"Ses değişti ({self.voice})")
+        self.add_bubble("Lee", f"Ses değişti: {self.voice}")
         self.speak("Ses değiştirildi.")
 
     def say_weather(self):
@@ -666,14 +777,7 @@ class LeeApp:
 
         threading.Thread(target=run, daemon=True).start()
 
-    def ask_tea_checkin(self, initial=False):
-        self.waiting_tea_answer = True
-        msg = "Beyza, çay içtin mi?" if initial else "Çay molası verdin mi Beyza?"
-        self.add_bubble("Lee", msg + " ☕")
-        self.speak(msg)
-        self.root.after(2 * 60 * 60 * 1000, self.ask_tea_checkin)
-
-    # input / mic
+    # ---------- input ----------
     def send_text(self):
         txt = self.entry.get().strip()
         if not txt:
@@ -681,64 +785,33 @@ class LeeApp:
         self.entry.delete(0, "end")
         self.handle_text(txt)
 
-    def on_listen_click(self):
-        if self.is_listening:
-            return
-        self.is_listening = True
-        self.robot.set_listening(True)
-        self.status_lbl.config(text="Dinliyorum...")
-        self.mic_btn.config(text="Dinliyorum...", state="disabled")
-
-        threading.Thread(target=self._listen_flow, daemon=True).start()
-
-    def _listen_flow(self):
-        heard = stt_listen(self.recognizer, self.mic, phrase_time_limit=7)
-        self.root.after(0, self._after_listen, heard)
-
-    def _after_listen(self, heard):
-        self.is_listening = False
-        self.robot.set_listening(False)
-        self.status_lbl.config(text="Lee aktif • Hazırım")
-        self.mic_btn.config(text="🎤 Dinle", state="normal")
-
-        if not heard:
-            self.add_bubble("Lee", "Anlayamadım. Tekrar söyler misin? 😅")
-            self.speak("Anlayamadım. Tekrar söyler misin?")
-            return
-
-        self.handle_text(heard)
-
-    # core logic
+    # ---------- core logic ----------
     def handle_text(self, text: str):
         self.add_bubble("Sen", text)
         t = normalize(text)
 
-        # tea answer mode
-        if self.waiting_tea_answer:
-            yes_words = ["evet", "ictim", "içtim", "içiyorum", "iciyorum", "içmişim", "icmisim"]
-            no_words = ["hayir", "hayır", "icmedim", "içmedim", "icmiyorum", "içmiyorum", "yok", "daha icmedim", "daha içmedim"]
-
-            if any(w in t for w in yes_words):
-                self.waiting_tea_answer = False
-                msg = "Afiyet olsun Beyza!"
-                self.add_bubble("Lee", msg + " ☕😊")
-                self.speak(msg)
-                return
-
-            if any(w in t for w in no_words):
-                self.waiting_tea_answer = False
-                msg = "Ben sana çay getireyim. Şaka! Ama bir mola iyi gelir."
-                self.add_bubble("Lee", msg + " ☕😄")
-                self.speak(msg)
-                return
-
-            msg = "Tam anlayamadım. 'Evet içtim' ya da 'Hayır içmedim' diyebilirsin."
-            self.add_bubble("Lee", msg + " 😅")
+        # NOTLARI SİL
+        if ("notları sil" in t) or ("notlari sil" in t) or ("tüm notları sil" in t) or ("tum notlari sil" in t):
+            try:
+                clear_notes()
+            except Exception:
+                pass
+            self.refresh_notes()
+            msg = "Tamam. Tüm notları sildim."
+            self.add_bubble("Lee", msg)
             self.speak(msg)
             return
 
-        # weather (auto city detect)
-        if "hava" in t:
+        # GÜNCELLE / YENİLE
+        if (t == "güncelle") or (t == "guncelle") or ("notları güncelle" in t) or ("notlari guncelle" in t) or ("notları yenile" in t) or ("notlari yenile" in t):
+            self.refresh_notes()
+            msg = "Notları güncelledim."
+            self.add_bubble("Lee", msg)
+            self.speak(msg)
+            return
+
+        # weather
+        if "hava" in t or "tahmin" in t:
             found = find_city_in_text(text)
             if found:
                 self.city_var.set(found)
@@ -761,14 +834,14 @@ class LeeApp:
             return
 
         # date
-        if "tarih" in t or "bugün günlerden" in t or t == "bugün":
+        if "tarih" in t or t == "bugün" or "bugün günlerden" in t:
             now = datetime.datetime.now()
             msg = f"Bugün {tr_day_name(now)}, {now.strftime('%d.%m.%Y')}."
             self.add_bubble("Lee", msg)
             self.speak(msg)
             return
 
-        # notes
+        # notes add
         if "not al" in t:
             note = text
             if ":" in text:
@@ -787,8 +860,9 @@ class LeeApp:
             self.speak(msg)
             return
 
+        # notes list
         if "notlar" in t:
-            lines = read_notes_last(6)
+            lines = read_notes_last(8)
             msg = "Son notların:\n" + ("\n".join(lines) if lines else "Henüz not yok.")
             self.add_bubble("Lee", msg)
             self.speak("Notlarını okudum.")
@@ -796,23 +870,49 @@ class LeeApp:
 
         # exit
         if t in ["kapat", "çık", "bitir", "exit", "quit"]:
-            msg = "Tamam, görüşürüz!"
-            self.add_bubble("Lee", msg + " 🤖💜")
+            msg = "Tamam, görüşürüz."
+            self.add_bubble("Lee", msg)
             self.speak(msg)
+            self.stop_always_listen()
             self.root.after(450, self.root.destroy)
             return
 
         # help
-        if "yardım" in t:
+        if "yardım" in t or "komut" in t:
             self.show_help()
             self.speak("Komutları ekrana getirdim.")
             return
 
-        # fallback
-        msg = "Bunu tam anlayamadım. İstersen 'yardım' yaz."
-        self.add_bubble("Lee", msg + " 😅")
-        self.speak(msg)
+        # ---------- LLM fallback (Ollama) ----------
+        self.show_typing()
 
+        def run_llm():
+            try:
+                reply = ollama_chat(text, self.llm_history)
+
+                # kötü cevap yakala -> 1 kez düzeltme dene
+                if is_bad_reply(reply):
+                    fix = ("Cevabın alakasız/uydurma oldu. Uydurma yapma. "
+                           "Emin değilsen 'Emin değilim' de ve 1 kısa soru sor. "
+                           "Kısa net cevap ver.")
+                    reply = ollama_chat(f"{fix}\nKullanıcı: {text}", self.llm_history)
+
+                # history güncelle (system + son 10 mesaj)
+                self.llm_history.append({"role": "user", "content": text})
+                self.llm_history.append({"role": "assistant", "content": reply})
+                self.llm_history = [self.llm_history[0]] + self.llm_history[-10:]
+
+            except Exception:
+                reply = "Beyin modülüne bağlanamadım. Ollama açık mı? (ollama serve)"
+
+            self.root.after(0, lambda: (self.hide_typing(), self.add_bubble("Lee", reply), self.speak(reply)))
+
+        threading.Thread(target=run_llm, daemon=True).start()
+
+
+# =========================
+# Run
+# =========================
 if __name__ == "__main__":
     root = tk.Tk()
     app = LeeApp(root)
